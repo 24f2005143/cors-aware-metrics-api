@@ -2,49 +2,79 @@
 import os
 import time
 import uuid
+import secrets
+from collections import defaultdict
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI()
 
-ALLOWED_ORIGIN = "https://dash-rg3ljf.example.com"
 EMAIL = os.environ.get("EMAIL", "YOUR_LOGGED_IN_EMAIL")
-
-# Strict CORS policy
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
+API_KEY = os.environ.get(
+    "ANALYTICS_API_KEY",
+    "ak_ggya7kimi7nhbligtlvbmjoy"
 )
 
-# Add required headers to every response
-class MetricsMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        start = time.perf_counter()
-        request_id = str(uuid.uuid4())
+STATS_ORIGIN = "https://dash-rg3ljf.example.com"
 
+
+@app.middleware("http")
+async def request_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    request_id = str(uuid.uuid4())
+    origin = request.headers.get("origin", "")
+    path = request.url.path
+
+    # Handle CORS preflight requests
+    if request.method == "OPTIONS":
+        if path == "/stats":
+            allowed = origin == STATS_ORIGIN
+        elif path == "/analytics":
+            allowed = True
+        else:
+            allowed = False
+
+        if not allowed:
+            response = Response(status_code=400)
+        else:
+            response = Response(status_code=200)
+
+        if allowed:
+            response.headers["Access-Control-Allow-Origin"] = (
+                STATS_ORIGIN if path == "/stats" else "*"
+            )
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET, OPTIONS" if path == "/stats"
+                else "POST, OPTIONS"
+            )
+            response.headers["Access-Control-Allow-Headers"] = (
+                "*" if path == "/stats"
+                else "Content-Type, X-API-Key"
+            )
+            response.headers["Access-Control-Max-Age"] = "600"
+
+    else:
         response = await call_next(request)
 
-        duration = time.perf_counter() - start
-        response.headers["X-Request-ID"] = request_id
-        response.headers["X-Process-Time"] = f"{duration:.6f}"
+        if path == "/stats" and origin == STATS_ORIGIN:
+            response.headers["Access-Control-Allow-Origin"] = STATS_ORIGIN
+        elif path == "/analytics":
+            response.headers["Access-Control-Allow-Origin"] = "*"
 
-        return response
-
-app.add_middleware(MetricsMiddleware)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = (
+        f"{max(0, time.perf_counter() - start):.6f}"
+    )
+    return response
 
 
 @app.get("/stats")
 def get_stats(values: str):
     try:
-        numbers = [int(value.strip()) for value in values.split(",")]
+        numbers = [int(v.strip()) for v in values.split(",")]
         if not numbers:
-            raise ValueError("At least one integer is required")
+            raise ValueError()
     except ValueError:
         return JSONResponse(
             status_code=400,
@@ -58,4 +88,59 @@ def get_stats(values: str):
         "min": min(numbers),
         "max": max(numbers),
         "mean": sum(numbers) / len(numbers),
+    }
+
+
+@app.post("/analytics")
+async def analytics(request: Request):
+    supplied_key = request.headers.get("X-API-Key", "")
+
+    if not secrets.compare_digest(supplied_key, API_KEY):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing API key"},
+        )
+
+    try:
+        body = await request.json()
+        events = body["events"]
+
+        if not isinstance(events, list):
+            raise ValueError()
+
+        for event in events:
+            if (
+                not isinstance(event, dict)
+                or not isinstance(event.get("user"), str)
+                or isinstance(event.get("amount"), bool)
+                or not isinstance(event.get("amount"), (int, float))
+            ):
+                raise ValueError()
+
+    except (ValueError, KeyError, TypeError):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid events payload"},
+        )
+
+    user_totals = defaultdict(float)
+    revenue = 0.0
+
+    for event in events:
+        amount = event["amount"]
+        if amount > 0:
+            revenue += amount
+            user_totals[event["user"]] += amount
+
+    top_user = (
+        max(user_totals, key=user_totals.get)
+        if user_totals else ""
+    )
+
+    return {
+        "email": EMAIL,
+        "total_events": len(events),
+        "unique_users": len({e["user"] for e in events}),
+        "revenue": revenue,
+        "top_user": top_user,
     }
